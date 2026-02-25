@@ -75,12 +75,12 @@ class Signer {
     });
 
     let LOAD_SCRIPTS = ["signer.js", "webmssdk.js", "xbogus.js"];
-    LOAD_SCRIPTS.forEach(async (script) => {
+    for (const script of LOAD_SCRIPTS) {
       await this.page.addScriptTag({
         path: `${__dirname}/javascript/${script}`,
       });
       // console.log("[+] " + script + " loaded");
-    });
+    }
 
     await this.page.evaluate(() => {
       window.generateSignature = function generateSignature(url) {
@@ -90,11 +90,12 @@ class Signer {
         return window.byted_acrawler.sign({ url: url });
       };
 
-      window.generateBogus = function generateBogus(params) {
-        if (typeof window.generateBogus !== "function") {
+      let _origBogus = window.generateBogus;
+      window.generateBogus = function (params, userAgent) {
+        if (typeof _origBogus !== "function") {
           throw "No X-Bogus function found";
         }
-        return window.generateBogus(params);
+        return _origBogus(params, userAgent);
       };
       return this;
     });
