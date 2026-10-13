@@ -1,11 +1,10 @@
 import time, requests, datetime, hashlib, hmac, random, zlib, json, datetime
 import requests, zlib, json, time, subprocess, string, secrets, os, sys
-from fake_useragent import FakeUserAgentError, UserAgent
 from requests_auth_aws_sigv4 import AWSSigV4
 from tiktok_uploader.cookies import load_cookies_from_file
-from tiktok_uploader.Browser import Browser
 from tiktok_uploader.bot_utils import *
-from tiktok_uploader import Config, Video, eprint
+from tiktok_uploader.Config import Config
+from tiktok_uploader.basics import eprint
 from dotenv import load_dotenv
 
 
@@ -13,18 +12,44 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Constants
-_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'
+_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+
+_UPLOAD_PHASE = "initializing"
+
+
+def _set_upload_phase(phase: str):
+	global _UPLOAD_PHASE
+	_UPLOAD_PHASE = phase
+
+
+def upload_failure():
+	"""Return a machine-readable retry decision for the ClipMaker wrapper.
+
+	Anything before the final project/post request cannot have created a TikTok
+	post and is therefore safe to retry through Studio. Once that request has
+	started, the result is ambiguous until Studio proves whether a post exists.
+	"""
+	return {
+		"provider": "tiktok-web-upload",
+		"stage": _UPLOAD_PHASE,
+		"commitAttempted": _UPLOAD_PHASE == "commit-request",
+		"safeToFallback": _UPLOAD_PHASE not in ("commit-request", "published"),
+	}
 
 
 def login(login_name: str):
+	from tiktok_uploader.Browser import Browser
 	# Check if login name is already save in file.
 	cookies = load_cookies_from_file(f"tiktok_session-{login_name}")
 	session_cookie = next((c for c in cookies if c["name"] == 'sessionid'), None)
-	session_from_file = session_cookie is not None
+	expires_at = (session_cookie or {}).get("expiry") or (session_cookie or {}).get("expires")
+	session_from_file = session_cookie is not None and (not expires_at or float(expires_at) > time.time() + 60)
 
 	if session_from_file:
 		print("Unnecessary login: session already saved!")
 		return session_cookie["value"]
+	if session_cookie is not None:
+		print("Saved TikTok session expired; opening Chrome to refresh it.")
 
 	browser = Browser.get()
 	response = browser.driver.get(os.getenv("TIKTOK_LOGIN_URL"))
@@ -46,17 +71,17 @@ def login(login_name: str):
 
 
 # Local Code...
-def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, allow_duet=0, allow_stitch=0, visibility_type=0, brand_organic_type=0, branded_content_type=0, ai_label=0, proxy=None):
-	try:
-		user_agent = UserAgent().random
-	except FakeUserAgentError as e:
-		user_agent = _UA
-		print("[-] Could not get random user agent, using default")
+def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, allow_duet=0, allow_stitch=0, visibility_type=0, brand_organic_type=0, branded_content_type=0, ai_label=0, proxy=None, music_id=None):
+	_set_upload_phase("preflight")
+	# A session that posts from a different browser every day reads as a stolen
+	# one. The account logged in from a desktop Chrome, so every upload claims
+	# that same browser, and the request signature is computed from it.
+	user_agent = _UA
 
 	cookies = load_cookies_from_file(f"tiktok_session-{session_user}")
 	session_id = next((c["value"] for c in cookies if c["name"] == 'sessionid'), None)
 	dc_id = next((c["value"] for c in cookies if c["name"] == 'tt-target-idc'), None)
-	
+
 	if not session_id:
 		eprint("No cookie with Tiktok session id found: use login to save session id")
 		sys.exit(1)
@@ -65,7 +90,8 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 		dc_id = "useast2a"
 	print("User successfully logged in.")
 	print(f"Tiktok Datacenter Assigned: {dc_id}")
-	
+	_set_upload_phase("session-ready")
+
 	print("Uploading video...")
 	# Parameter validation,
 	if schedule_time and (schedule_time > 864000 or schedule_time < 900):
@@ -102,14 +128,31 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 
 	creation_id = generate_random_string(21, True)
 	project_url = f"https://www.tiktok.com/api/v1/web/project/create/?creation_id={creation_id}&type=1&aid=1988"
+	_set_upload_phase("project-create")
 	r = session.post(project_url)
 
 	if not assert_success(project_url, r):
 		return False
 
-	# get project_id
-	project_id = r.json()["project"]["project_id"]
-	video_id, session_key, upload_id, crcs, upload_host, store_uri, video_auth, aws_auth = upload_to_tiktok(video, session)
+	# TikTok often returns HTTP 200 for an expired session. Treat the missing
+	# project as an authentication failure instead of raising an opaque KeyError.
+	try:
+		project_payload = r.json()
+	except ValueError:
+		eprint("[-] TikTok returned an invalid project response; refresh this account session.")
+		return False
+	project_id = project_payload.get("project", {}).get("project_id")
+	if not project_id:
+		status_message = project_payload.get("status_msg") or project_payload.get("message") or "session rejected"
+		eprint(f"[-] TikTok session is expired or invalid ({status_message}); log in again for '{session_user}'.")
+		return False
+	_set_upload_phase("project-created")
+	_set_upload_phase("media-upload")
+	upload_result = upload_to_tiktok(video, session)
+	if not upload_result:
+		return False
+	video_id, session_key, upload_id, crcs, upload_host, store_uri, video_auth, aws_auth = upload_result
+	_set_upload_phase("media-uploaded")
 
 	url = f"https://{upload_host}/{store_uri}?uploadID={upload_id}&phase=finish&uploadmode=part"
 	headers = {
@@ -239,6 +282,12 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 	# }
 
 
+	# music_info: si music_id fourni, on attache le son officiel TikTok au post.
+	# Best-effort — TikTok peut rejeter un music_id qui n'est pas autorisé pour ce compte.
+	music_info = {}
+	if music_id:
+		music_info["music_id"] = str(music_id)
+
 	data = {
 		"post_common_info": {
 			"creation_id": creation_id,
@@ -258,13 +307,10 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 					"video_id": video_id
 				},
 				"privacy_setting_info": {
-					"visibility_type": 0,
+					"visibility_type": visibility_type,
 					"allow_duet": 1,
 					"allow_stitch": 1,
 					"allow_comment": 1
-				},
-				"aigc_info": {
-					"aigc_label_type": ai_label
 				}
 			}
 		],
@@ -277,7 +323,7 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 					"text": title,
 					"text_extra": text_extra,
 					"markup_text": markup_text,
-					"music_info": {},
+					"music_info": music_info,
 					"poster_delay": 0,
 				}
 			}
@@ -288,7 +334,7 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 	# Add schedule_time to the payload if it's provided
 	if schedule_time > 0:
 		data["feature_common_info_list"][0]["schedule_time"] = schedule_time + int(time.time())
-	
+
 	uploaded = False
 	while True:
 		mstoken = session.cookies.get("msToken")
@@ -320,17 +366,41 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 
 		# url = f"https://www.tiktok.com/api/v1/web/project/post/"
 		url = f"https://www.tiktok.com/tiktok/web/project/post/v1/"
-		r = session.request("POST", url, params=project_post_dict, data=json.dumps(data), headers=headers)
+		_set_upload_phase("commit-request")
+		try:
+			r = session.request("POST", url, params=project_post_dict, data=json.dumps(data), headers=headers)
+		except requests.RequestException as error:
+			eprint(f"[-] TikTok final publish response was lost: {type(error).__name__}")
+			return False
 		if not assertSuccess(url, r):
 			print("[-] Published failed, try later again")
 			printError(url, r)
 			return False
 
-		if r.json()["status_code"] == 0:
+		post_payload = r.json()
+		if post_payload["status_code"] == 0:
+			_set_upload_phase("published")
 			print(f"Published successfully {'| Scheduled for ' + str(schedule_time) if schedule_time else ''}")
-			uploaded = True
+			post_data = post_payload.get("data") if isinstance(post_payload.get("data"), dict) else {}
+			explicit_post_id = (
+				post_payload.get("aweme_id") or post_payload.get("item_id") or post_payload.get("post_id")
+				or post_data.get("aweme_id") or post_data.get("item_id") or post_data.get("post_id")
+			)
+			platform_post_id = str(explicit_post_id or video_id)
+			uploaded = {
+				"provider": "tiktok-web-upload",
+				"platformPostId": platform_post_id,
+				"releaseUrl": f"https://www.tiktok.com/@{session_user}/video/{platform_post_id}",
+				"raw": {
+					"privacy": "public" if visibility_type == 0 else "private",
+					"creationId": creation_id,
+					"statusCode": 0,
+					"uploadVideoId": str(video_id),
+				},
+			}
 			break
 		else:
+			_set_upload_phase("commit-rejected")
 			print("[-] Publish failed to Tiktok, trying again...")
 			printError(url, r)
 			return False
@@ -348,6 +418,10 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 	if not uploaded:
 		print("[-] Could not upload video")
 		return False
+	return uploaded
+
+
+
 	# Check if video uploaded successfully (Tiktok has changed endpoint for this)
 	# url = f"https://www.tiktok.com/api/v1/web/project/list/?aid=1988"
 	#
