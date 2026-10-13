@@ -128,19 +128,34 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Personal Development Files
-# CookiesDir/
-# CookiesDir/*
+# Personal Development Files (legacy 1.x data folders)
+CookiesDir/
 VideosDirPath/
 *.cookie
 output/
 *.mp4
-youtube_downloader.py
+# ...except the launch film the README links to
+!docs/media/*.mp4
 
+# Local SQLite database (api/scheduler) — contains usernames, login session
+# history, and cookie paths. Never commit.
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
+# Environment
+.env
+
+# Node
 node_modules/
+*.tsbuildinfo
 
-tests/*
-.idea/*
+# IDE
+.idea/
+.vscode/
 
-tiktok_uploader\tiktok-signature\command.txt
+# Local autotok data (sessions are account credentials)
+.autotok/
