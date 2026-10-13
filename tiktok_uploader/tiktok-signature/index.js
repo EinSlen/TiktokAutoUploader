@@ -1,4 +1,5 @@
 const { createCipheriv } = require("crypto");
+const { existsSync } = require("fs");
 const { devices, chromium } = require("playwright-chromium");
 const Utils = require("./utils");
 const iPhone11 = devices["iPhone 11 Pro"];
@@ -11,6 +12,8 @@ class Signer {
     "--disable-infobars",
     "--window-size=1920,1080",
     "--start-maximized",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
   ];
   // Default TikTok loading page
   default_url = "https://www.tiktok.com/@rihanna?lang=en";
@@ -39,6 +42,12 @@ class Signer {
       ignoreDefaultArgs: ["--mute-audio", "--hide-scrollbars"],
       ignoreHTTPSErrors: true,
     };
+
+    const chromiumExecutable =
+      process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium";
+    if (existsSync(chromiumExecutable)) {
+      this.options.executablePath = chromiumExecutable;
+    }
   }
 
   async init() {
@@ -70,16 +79,16 @@ class Signer {
         : route.continue();
     });
 
-    await this.page.goto(this.default_url, {
-      waitUntil: "networkidle",
-    });
+    // Signature generation is fully local. Navigating to TikTok here made the
+    // cron depend on an unrelated page reaching a browser load milestone and
+    // could hang forever behind bot protection.
+    await this.page.setContent("<!doctype html><html><body></body></html>");
 
     let LOAD_SCRIPTS = ["signer.js", "webmssdk.js", "xbogus.js"];
     for (const script of LOAD_SCRIPTS) {
       await this.page.addScriptTag({
         path: `${__dirname}/javascript/${script}`,
       });
-      // console.log("[+] " + script + " loaded");
     }
 
     await this.page.evaluate(() => {
@@ -90,13 +99,9 @@ class Signer {
         return window.byted_acrawler.sign({ url: url });
       };
 
-      let _origBogus = window.generateBogus;
-      window.generateBogus = function (params, userAgent) {
-        if (typeof _origBogus !== "function") {
-          throw "No X-Bogus function found";
-        }
-        return _origBogus(params, userAgent);
-      };
+      if (typeof window.generateBogus !== "function") {
+        throw "No X-Bogus function found";
+      }
       return this;
     });
   }
